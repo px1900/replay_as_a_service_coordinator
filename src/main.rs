@@ -1,13 +1,19 @@
+use std::sync::{Arc};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
+
+
+type SharedReplayServers = Arc<Mutex<Vec<Arc<Mutex<TcpStream>>>>>;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // Bind the TCP listener to the address
-    let listener = TcpListener::bind("127.0.0.1:18080").await?;
+    let listener: TcpListener = TcpListener::bind("10.145.21.43:18080").await?;
 
-    println!("Server listening on 127.0.0.1:18080");
+    let replay_servers: SharedReplayServers = Arc::new(Mutex::new(Vec::new()));
+
+    println!("Server listening on 10.145.21.43:18080");
 
     loop {
         // Accept an incoming connection
@@ -18,9 +24,28 @@ async fn main() -> io::Result<()> {
             println!("New connection from {}", peer_addr);
         }
 
+        let new_replay_server = match connect_to_replay_server(socket.peer_addr().unwrap().ip().to_string()).await {
+            Ok(stream) => {
+                println!("Connected to replay_server, peer_addr = {}", socket.peer_addr().unwrap().ip().to_string());
+                stream
+            },
+            Err(e) => {
+                println!("Error when connecting to replay server: {:?}", e);
+                return Ok(());
+            }
+        };
+
+        {
+            // Add the new replay server to the replay_servers
+            let mut replay_servers_locked = replay_servers.lock().await;
+            replay_servers_locked.push(Arc::new(Mutex::new(new_replay_server)));
+        }
+
+        let replay_servers_for_task = Arc::clone(&replay_servers);
+
         // Spawn a new task to handle the connection
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket).await {
+        tokio::spawn(async {
+            if let Err(e) = handle_connection(socket, replay_servers_for_task).await {
                 eprintln!("Failed to handle connection; err = {:?}", e);
             }
         });
@@ -28,7 +53,7 @@ async fn main() -> io::Result<()> {
 }
 
 // Function to handle the connection
-async fn handle_connection(mut socket: TcpStream) -> io::Result<()> {
+async fn handle_connection(mut socket: TcpStream, replay_servers: SharedReplayServers) -> io::Result<()> {
 
 
     // Define a mscp::channel
@@ -40,7 +65,7 @@ async fn handle_connection(mut socket: TcpStream) -> io::Result<()> {
     println!("New connection from {}", peer_addr);
     // Spawn a new task to start a socket client with the peer address and port 64000
     tokio::spawn( async {
-        match distribute_data_back_to_servers(rx_request, tx_response, peer_addr).await {
+        match distribute_data_back_to_servers(rx_request, tx_response, replay_servers).await {
             Ok(_) => {},
             Err(e) => {
                 println!("Error when distributing data back to servers: {:?}", e);
@@ -52,7 +77,8 @@ async fn handle_connection(mut socket: TcpStream) -> io::Result<()> {
 
 }
 
-async fn distribute_data_back_to_servers(mut rx_request: mpsc::Receiver<Vec<u8>>, tx_response: mpsc::Sender<Vec<u8>>, peer_addr: String) -> io::Result<()> {
+async fn connect_to_replay_server(peer_addr: String) -> io::Result<TcpStream> {
+    println!("Connecting to replay server: {}", format!("{}:64000", peer_addr));
     let mut stream = TcpStream::connect(format!("{}:64000", peer_addr)).await?;
 
     // Before forwarding the data, we need to initialize the connection with the peer server
@@ -74,12 +100,43 @@ async fn distribute_data_back_to_servers(mut rx_request: mpsc::Receiver<Vec<u8>>
     // Read response from the peer server
     let mut response = vec![0u8; 1024];
     stream.read(&mut response).await?;
-    println!("Got response from peer server: {:?}", String::from_utf8_lossy(&response));
+    println!("Got response from peer server");
 
+    Ok(stream)
+}
+
+async fn distribute_data_back_to_servers(mut rx_request: mpsc::Receiver<Vec<u8>>, tx_response: mpsc::Sender<Vec<u8>>, replay_servers: SharedReplayServers) -> io::Result<()> {
 
     while let Some(data) = rx_request.recv().await {
+        // Let's acquire a replay server to do the task
+        let replay_servers_locked = replay_servers.lock().await;
+        let mut iter_num = 0;
+        loop {
+            if let Ok(replay_server_stream) = replay_servers_locked[iter_num].try_lock() {
+                match distribute_task_to_one_server(data.clone(), replay_server_stream).await {
+                    Ok(response) => {
+                        tx_response.send(response).await;
+                        break;
+                    },
+                    Err(e) => {
+                        println!("Error when distributing task to one server: {:?}", e);
+                    }
+                }
+            } else {
+                iter_num = (iter_num + 1) % replay_servers_locked.len();
+            }
+        }
+
         println!("{} {}, client: received {} bytes from the channel", file!(), line!(), data.len());
-        match stream.write_all(&data).await {
+        
+        // println!("{} {}, client: got response from peer server: {:?}", file!(), line!(), response);
+    }
+    Ok(())
+}
+
+async fn distribute_task_to_one_server(data: Vec<u8>, mut stream: tokio::sync::MutexGuard<'_, TcpStream>) -> io::Result<Vec<u8>> {
+
+    match stream.write_all(&data).await {
             Ok(_) => {
                 println!("{} {}, client: sent {} bytes to the peer server, data = {:?}", file!(), line!(), data.len(), data);
                 stream.flush().await?;
@@ -87,7 +144,7 @@ async fn distribute_data_back_to_servers(mut rx_request: mpsc::Receiver<Vec<u8>>
             },
             Err(e) => {
                 println!("Error when sending data to peer server: {:?}", e);
-                return Ok(());
+                return Err(e);
             }
         }
         // Read response from the peer server
@@ -95,22 +152,13 @@ async fn distribute_data_back_to_servers(mut rx_request: mpsc::Receiver<Vec<u8>>
         match stream.read(&mut response).await {
             Ok(byte_num) => {
                 println!("{} {}, client: received {} bytes from the peer server", file!(), line!(), byte_num);
-                match tx_response.send(response[..byte_num].to_vec()).await {
-                    Ok(_) => {},
-                    Err(e) => {
-                        println!("Error when sending response to channel: {:?}", e);
-                        return Ok(());
-                    }
-                }
+                return Ok(response[..byte_num].to_vec());
             },
             Err(e) => {
                 println!("Error when reading response from peer server: {:?}", e);
-                return Ok(());
+                return Err(e);
             }
         }
-        // println!("{} {}, client: got response from peer server: {:?}", file!(), line!(), response);
-    }
-    Ok(())
 }
 
 async fn handle_incoming_data(mut socket: TcpStream, tx_request: mpsc::Sender<Vec<u8>>, mut rx_response: mpsc::Receiver<Vec<u8>>) -> io::Result<()> {
@@ -145,38 +193,6 @@ async fn handle_incoming_data(mut socket: TcpStream, tx_request: mpsc::Sender<Ve
 
         }
 
-        // let mut record_num_buf = [0u8; 4];
-        // let stream_read_len = socket.read_exact(&mut record_num_buf).await?;
-        // if stream_read_len == 0 {
-        //     return Ok(());
-        // }
-
-        // let record_num = u32::from_be_bytes(record_num_buf) as usize;
-        // println!("record_num: {}", record_num);
-    
-        // for i in 0..record_num {
-        //     let mut record_len_buf = [0u8; 4];
-        //     socket.read_exact(&mut record_len_buf).await?;
-        //     let record_len = u32::from_be_bytes(record_len_buf) as usize;
-        //     let mut record_buf = vec![0u8; record_len];
-        //     socket.read_exact(&mut record_buf).await?;
-        //     println!("got one record with len = {}", record_len);
-        // }
-
-        // let mut image_len_buf = [0u8; 4];
-        // let stream_read_len = socket.read_exact(&mut image_len_buf).await?;
-        // if stream_read_len == 0 {
-        //     return Ok(());
-        // }
-
-        // let image_len = u32::from_be_bytes(image_len_buf) as usize;
-
-        // if image_len != 0 {
-        //     println!("will an image with length {}", image_len);
-        //     let mut image_buf = vec![0u8; image_len];
-        //     socket.read_exact(&mut image_buf).await?;
-        //     println!("read an image with length {}", image_len);
-        // }
     }
 }
 
