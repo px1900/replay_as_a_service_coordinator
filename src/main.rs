@@ -1,4 +1,6 @@
+use core::time;
 use std::sync::{Arc};
+use std::env;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
@@ -81,10 +83,13 @@ async fn connect_to_replay_server(peer_addr: String) -> io::Result<TcpStream> {
     println!("Connecting to replay server: {}", format!("{}:64000", peer_addr));
     let mut stream = TcpStream::connect(format!("{}:64000", peer_addr)).await?;
 
+    let tenant_id_key = "tenant_id";
+    let tenant_id_env = env::var(tenant_id_key).unwrap();
+    let timeline_id_key = "timeline_id";
+    let timeline_id_env = env::var(timeline_id_key).unwrap();
+
     // Before forwarding the data, we need to initialize the connection with the peer server
-    let tenant_id = "fe705bb4743223a63ec8690f20b2e518";
-    let timeline_id = "4d285e6c0aea3f18c41e219cf2bab4e7";
-    let init_string = format!("pagestream_v2 {} {}", tenant_id, timeline_id);
+    let init_string = format!("pagestream_v2 {} {}", tenant_id_env, timeline_id_env);
     let init_string_len = init_string.len() as u32 + 4;
     let init_string_len_buf = init_string_len.to_be_bytes();
     // The sent msg should be Q + init_string_len_buf + init_string
