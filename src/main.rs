@@ -3,17 +3,17 @@ use std::sync::{Arc};
 use std::env;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 
-type SharedReplayServers = Arc<Mutex<Vec<Arc<Mutex<TcpStream>>>>>;
+type SharedReplayServers = Arc<RwLock<Vec<Arc<Mutex<TcpStream>>>>>;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // Bind the TCP listener to the address
     let listener: TcpListener = TcpListener::bind("10.145.21.43:18080").await?;
 
-    let replay_servers: SharedReplayServers = Arc::new(Mutex::new(Vec::new()));
+    let replay_workers: SharedReplayServers = Arc::new(RwLock::new(Vec::new()));
 
     println!("Server listening on 10.145.21.43:18080");
 
@@ -26,28 +26,32 @@ async fn main() -> io::Result<()> {
             println!("New connection from {}", peer_addr);
         }
 
-        let new_replay_server = match connect_to_replay_server(socket.peer_addr().unwrap().ip().to_string()).await {
+        // One timeline try to establish a NEW connection with the coordinator
+        // One timeline may establish multiple connections with the coordinator, for each time, 
+        // the coordinator will register a new replay worker in its server
+        let new_replay_worker = match register_worker_in_peer_server(socket.peer_addr().unwrap().ip().to_string()).await {
             Ok(stream) => {
-                println!("Connected to replay_server, peer_addr = {}", socket.peer_addr().unwrap().ip().to_string());
+                println!("Connected to replay_worker, peer_addr = {}", socket.peer_addr().unwrap().ip().to_string());
                 stream
             },
             Err(e) => {
-                println!("Error when connecting to replay server: {:?}", e);
+                println!("Error when connecting to replay worker: {:?}", e);
                 return Ok(());
             }
         };
 
+        // We remember the timeline's connection in the replay_workers list
         {
-            // Add the new replay server to the replay_servers
-            let mut replay_servers_locked = replay_servers.lock().await;
-            replay_servers_locked.push(Arc::new(Mutex::new(new_replay_server)));
+            // Add the new replay server to the replay_workers
+            let mut replay_workers_locked = replay_workers.write().await;
+            replay_workers_locked.push(Arc::new(tokio::sync::Mutex::new(new_replay_worker)));
         }
 
-        let replay_servers_for_task = Arc::clone(&replay_servers);
+        let replay_workers_for_task = Arc::clone(&replay_workers);
 
         // Spawn a new task to handle the connection
         tokio::spawn(async {
-            if let Err(e) = handle_connection(socket, replay_servers_for_task).await {
+            if let Err(e) = handle_connection(socket, replay_workers_for_task).await {
                 eprintln!("Failed to handle connection; err = {:?}", e);
             }
         });
@@ -55,10 +59,13 @@ async fn main() -> io::Result<()> {
 }
 
 // Function to handle the connection
-async fn handle_connection(mut socket: TcpStream, replay_servers: SharedReplayServers) -> io::Result<()> {
+async fn handle_connection(mut socket: TcpStream, replay_workers: SharedReplayServers) -> io::Result<()> {
 
 
     // Define a mscp::channel
+    // Timeline --timeline_socket--> timeline_listening_thread --tx_request--> * --rx_request--> server_listening_thread --> woker_socket --> Worker
+    // Timeline <--timeline_socket-- timeline_listening_thread <--rx_response- * <-tx_response-- server_listening_thread <-- worker_socket -- Worker
+
     let (tx_request, mut rx_request) = mpsc::channel::<Vec<u8>>(8192);
     let (tx_response, mut rx_response) = mpsc::channel::<Vec<u8>>(16384);
 
@@ -67,10 +74,10 @@ async fn handle_connection(mut socket: TcpStream, replay_servers: SharedReplaySe
     println!("New connection from {}", peer_addr);
     // Spawn a new task to start a socket client with the peer address and port 64000
     tokio::spawn( async {
-        match distribute_data_back_to_servers(rx_request, tx_response, replay_servers).await {
+        match distribute_task_to_workers(rx_request, tx_response, replay_workers).await {
             Ok(_) => {},
             Err(e) => {
-                println!("Error when distributing data back to servers: {:?}", e);
+                println!("Error when distributing task to workers: {:?}", e);
             }
         }
     });
@@ -79,7 +86,7 @@ async fn handle_connection(mut socket: TcpStream, replay_servers: SharedReplaySe
 
 }
 
-async fn connect_to_replay_server(peer_addr: String) -> io::Result<TcpStream> {
+async fn register_worker_in_peer_server(peer_addr: String) -> io::Result<TcpStream> {
     println!("Connecting to replay server: {}", format!("{}:64000", peer_addr));
     let mut stream = TcpStream::connect(format!("{}:64000", peer_addr)).await?;
 
@@ -110,25 +117,31 @@ async fn connect_to_replay_server(peer_addr: String) -> io::Result<TcpStream> {
     Ok(stream)
 }
 
-async fn distribute_data_back_to_servers(mut rx_request: mpsc::Receiver<Vec<u8>>, tx_response: mpsc::Sender<Vec<u8>>, replay_servers: SharedReplayServers) -> io::Result<()> {
+async fn distribute_task_to_workers(mut rx_request: mpsc::Receiver<Vec<u8>>, tx_response: mpsc::Sender<Vec<u8>>, replay_workers: SharedReplayServers) -> io::Result<()> {
 
     while let Some(data) = rx_request.recv().await {
+        println!("{} {}, worker_listener: received {} bytes from the channel", file!(), line!(), data.len());
         // Let's acquire a replay server to do the task
-        let replay_servers_locked = replay_servers.lock().await;
+        let replay_workers_locked = replay_workers.read().await;
         let mut iter_num = 0;
         loop {
-            if let Ok(replay_server_stream) = replay_servers_locked[iter_num].try_lock() {
-                match distribute_task_to_one_server(data.clone(), replay_server_stream).await {
+            if let Ok(replay_worker_stream) = replay_workers_locked[iter_num].try_lock() {
+                println!("worker_listener: try to distribute this task to {} worker", iter_num);
+                match distribute_task_to_one_server(data.clone(), replay_worker_stream).await {
                     Ok(response) => {
-                        tx_response.send(response).await;
+                        println!("worker_listener: distribute this task to {} worker", iter_num);
+                        if let Err(e) = tx_response.send(response).await {
+                            println!("worker_listener: Error when sending response to channel: {:?}", e);
+                        }
+                        println!("{} {}, worker_listener: sent {} bytes to the channel", file!(), line!(), data.len());
                         break;
                     },
                     Err(e) => {
-                        println!("Error when distributing task to one server: {:?}", e);
+                        println!("worker_listener: Error when distributing task to one worker: {:?}", e);
                     }
                 }
             } else {
-                iter_num = (iter_num + 1) % replay_servers_locked.len();
+                iter_num = (iter_num + 1) % replay_workers_locked.len();
             }
         }
 
@@ -143,9 +156,8 @@ async fn distribute_task_to_one_server(data: Vec<u8>, mut stream: tokio::sync::M
 
     match stream.write_all(&data).await {
             Ok(_) => {
-                println!("{} {}, client: sent {} bytes to the peer server, data = {:?}", file!(), line!(), data.len(), data);
+                println!("{} {}, worker_listener: sent {} bytes to the replay_worker", file!(), line!(), data.len());
                 stream.flush().await?;
-                println!("{} {}, client: flushed {} bytes to the peer server", file!(), line!(), data.len());
             },
             Err(e) => {
                 println!("Error when sending data to peer server: {:?}", e);
@@ -156,7 +168,7 @@ async fn distribute_task_to_one_server(data: Vec<u8>, mut stream: tokio::sync::M
         let mut response = vec![0u8; 8192*2];
         match stream.read(&mut response).await {
             Ok(byte_num) => {
-                println!("{} {}, client: received {} bytes from the peer server", file!(), line!(), byte_num);
+                println!("{} {}, worker_listener: receive {} bytes from the replay_worker", file!(), line!(), data.len());
                 return Ok(response[..byte_num].to_vec());
             },
             Err(e) => {
@@ -175,7 +187,7 @@ async fn handle_incoming_data(mut socket: TcpStream, tx_request: mpsc::Sender<Ve
         if n == 0 {
             return Ok(());
         }
-        println!("{} {}, server: received {} bytes from the socket", file!(), line!(), n);
+        println!("{} {}, timeline_listener: received {} bytes from the socket", file!(), line!(), n);
         match tx_request.send(buffer[..n].to_vec()).await {
             Ok(_) => {},
             Err(e) => {
@@ -183,17 +195,17 @@ async fn handle_incoming_data(mut socket: TcpStream, tx_request: mpsc::Sender<Ve
                 return Ok(());
             }
         }
-        println!("{} {}, server: sent {} bytes to the channel", file!(), line!(), n);
+        println!("{} {}, timeline_listener: sent {} bytes to the channel", file!(), line!(), n);
 
         match rx_response.recv().await {
             Some(response) => {
-                println!("{} {}, server: received {} bytes from the channel", file!(), line!(), response.len());
+                println!("{} {}, timeline_listener: received {} bytes from the channel", file!(), line!(), response.len());
                 socket.write_all(&response).await?;
                 socket.flush().await?;
-                println!("{} {}, server: sent {} bytes to the socket", file!(), line!(), response.len());
+                println!("{} {}, timeline_listener: sent {} bytes to the socket", file!(), line!(), response.len());
             },
             None => {
-                println!("{} {}, server: received None from the channel", file!(), line!());
+                println!("{} {}, timeline_listener: received None from the channel", file!(), line!());
             }
 
         }
