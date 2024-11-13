@@ -11,11 +11,11 @@ type SharedReplayServers = Arc<RwLock<Vec<Arc<Mutex<TcpStream>>>>>;
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // Bind the TCP listener to the address
-    let listener: TcpListener = TcpListener::bind("10.145.21.43:18080").await?;
+    let listener: TcpListener = TcpListener::bind("10.145.21.36:18080").await?;
 
     let replay_workers: SharedReplayServers = Arc::new(RwLock::new(Vec::new()));
 
-    println!("Server listening on 10.145.21.43:18080");
+    println!("Server listening on 10.145.21.36:18080");
 
     loop {
         // Accept an incoming connection
@@ -66,8 +66,8 @@ async fn handle_connection(mut socket: TcpStream, replay_workers: SharedReplaySe
     // Timeline --timeline_socket--> timeline_listening_thread --tx_request--> * --rx_request--> server_listening_thread --> woker_socket --> Worker
     // Timeline <--timeline_socket-- timeline_listening_thread <--rx_response- * <-tx_response-- server_listening_thread <-- worker_socket -- Worker
 
-    let (tx_request, mut rx_request) = mpsc::channel::<Vec<u8>>(8192);
-    let (tx_response, mut rx_response) = mpsc::channel::<Vec<u8>>(16384);
+    let (tx_request, mut rx_request) = mpsc::channel::<Vec<u8>>(8192*20);
+    let (tx_response, mut rx_response) = mpsc::channel::<Vec<u8>>(8192*20);
 
     // Get the peer address
     let peer_addr = socket.peer_addr()?.ip().to_string();
@@ -129,11 +129,10 @@ async fn distribute_task_to_workers(mut rx_request: mpsc::Receiver<Vec<u8>>, tx_
                 println!("worker_listener: try to distribute this task to {} worker", iter_num);
                 match distribute_task_to_one_server(data.clone(), replay_worker_stream).await {
                     Ok(response) => {
-                        println!("worker_listener: distribute this task to {} worker", iter_num);
+                        println!("{} {}, worker_listener: sent {} bytes to the channel", file!(), line!(), response.len());
                         if let Err(e) = tx_response.send(response).await {
                             println!("worker_listener: Error when sending response to channel: {:?}", e);
                         }
-                        println!("{} {}, worker_listener: sent {} bytes to the channel", file!(), line!(), data.len());
                         break;
                     },
                     Err(e) => {
@@ -144,8 +143,6 @@ async fn distribute_task_to_workers(mut rx_request: mpsc::Receiver<Vec<u8>>, tx_
                 iter_num = (iter_num + 1) % replay_workers_locked.len();
             }
         }
-
-        println!("{} {}, client: received {} bytes from the channel", file!(), line!(), data.len());
         
         // println!("{} {}, client: got response from peer server: {:?}", file!(), line!(), response);
     }
@@ -155,38 +152,46 @@ async fn distribute_task_to_workers(mut rx_request: mpsc::Receiver<Vec<u8>>, tx_
 async fn distribute_task_to_one_server(data: Vec<u8>, mut stream: tokio::sync::MutexGuard<'_, TcpStream>) -> io::Result<Vec<u8>> {
 
     match stream.write_all(&data).await {
-            Ok(_) => {
-                println!("{} {}, worker_listener: sent {} bytes to the replay_worker", file!(), line!(), data.len());
-                stream.flush().await?;
-            },
-            Err(e) => {
-                println!("Error when sending data to peer server: {:?}", e);
-                return Err(e);
-            }
+        Ok(_) => {
+            println!("{} {}, worker_listener: sent {} bytes to the replay_worker", file!(), line!(), data.len());
+            stream.flush().await?;
+        },
+        Err(e) => {
+            println!("Error when sending data to peer server: {:?}", e);
+            return Err(e);
         }
-        // Read response from the peer server
-        let mut response = vec![0u8; 8192*2];
-        match stream.read(&mut response).await {
-            Ok(byte_num) => {
-                println!("{} {}, worker_listener: receive {} bytes from the replay_worker", file!(), line!(), data.len());
-                return Ok(response[..byte_num].to_vec());
-            },
-            Err(e) => {
-                println!("Error when reading response from peer server: {:?}", e);
-                return Err(e);
-            }
+    }
+    // Read response from the peer server
+    let mut response = vec![0u8; 8192*20];
+    match stream.read(&mut response).await {
+        Ok(byte_num) => {
+            println!("{} {}, worker_listener: receive {} bytes from the replay_worker", file!(), line!(), byte_num);
+            return Ok(response[..byte_num].to_vec());
+        },
+        Err(e) => {
+            println!("Error when reading response from peer server: {:?}", e);
+            return Err(e);
         }
+    }
 }
 
 async fn handle_incoming_data(mut socket: TcpStream, tx_request: mpsc::Sender<Vec<u8>>, mut rx_response: mpsc::Receiver<Vec<u8>>) -> io::Result<()> {
     loop {
 
         // Read the incoming data from the socket, then write it to Sender
-        let mut buffer = [0; 8192*16];
-        let n = socket.read(&mut buffer).await?;
+        let mut buffer = [0; 8192*20];
+        let mut n = socket.read(&mut buffer).await?;
         if n == 0 {
             return Ok(());
         }
+        
+        // Convert the buffer[1..5] to u32
+        let target_buffer_size: u32 = u32::from_be_bytes(buffer[1..5].try_into().unwrap());
+        while n < (target_buffer_size+1) as usize  {
+            let n2 = socket.read(&mut buffer[n..]).await?;
+            n += n2;
+        }
+
         println!("{} {}, timeline_listener: received {} bytes from the socket", file!(), line!(), n);
         match tx_request.send(buffer[..n].to_vec()).await {
             Ok(_) => {},
