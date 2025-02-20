@@ -1,12 +1,12 @@
 use core::time;
 use std::sync::{Arc};
-use std::env;
+use std::{env, string};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 
-type SharedReplayServers = Arc<RwLock<Vec<Arc<Mutex<TcpStream>>>>>;
+type SharedReplayServers = Arc<RwLock<Vec<Arc< (Mutex<TcpStream>,String) >>>>;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -44,12 +44,14 @@ async fn main() -> io::Result<()> {
         {
             // Add the new replay server to the replay_workers
             let mut replay_workers_locked = replay_workers.write().await;
-            replay_workers_locked.push(Arc::new(tokio::sync::Mutex::new(new_replay_worker)));
+            replay_workers_locked.push(Arc::new((tokio::sync::Mutex::new(new_replay_worker), socket.peer_addr().unwrap().ip().to_string()+socket.peer_addr().unwrap().port().to_string().as_str())));
+            println!("{} {}, timeline_listener: replay_workers.len() = {}", file!(), line!(), replay_workers_locked.len());
         }
 
         let replay_workers_for_task = Arc::clone(&replay_workers);
 
         // Spawn a new task to handle the connection
+        let replay_workers_for_task = Arc::clone(&replay_workers_for_task);
         tokio::spawn(async {
             if let Err(e) = handle_connection(socket, replay_workers_for_task).await {
                 eprintln!("Failed to handle connection; err = {:?}", e);
@@ -66,23 +68,23 @@ async fn handle_connection(mut socket: TcpStream, replay_workers: SharedReplaySe
     // Timeline --timeline_socket--> timeline_listening_thread --tx_request--> * --rx_request--> server_listening_thread --> woker_socket --> Worker
     // Timeline <--timeline_socket-- timeline_listening_thread <--rx_response- * <-tx_response-- server_listening_thread <-- worker_socket -- Worker
 
-    let (tx_request, mut rx_request) = mpsc::channel::<Vec<u8>>(8192*20);
-    let (tx_response, mut rx_response) = mpsc::channel::<Vec<u8>>(8192*20);
+    // let (tx_request, mut rx_request) = mpsc::channel::<Vec<u8>>(8192*20);
+    // let (tx_response, mut rx_response) = mpsc::channel::<Vec<u8>>(8192*20);
 
     // Get the peer address
     let peer_addr = socket.peer_addr()?.ip().to_string();
     println!("New connection from {}", peer_addr);
     // Spawn a new task to start a socket client with the peer address and port 64000
-    tokio::spawn( async {
-        match distribute_task_to_workers(rx_request, tx_response, replay_workers).await {
-            Ok(_) => {},
-            Err(e) => {
-                println!("Error when distributing task to workers: {:?}", e);
-            }
-        }
-    });
+    // tokio::spawn( async {
+    //     match distribute_task_to_workers(replay_workers).await {
+    //         Ok(_) => {},
+    //         Err(e) => {
+    //             println!("Error when distributing task to workers: {:?}", e);
+    //         }
+    //     }
+    // });
 
-    return handle_incoming_data(socket, tx_request, rx_response).await;
+    return handle_incoming_data(socket, replay_workers).await;
 
 }
 
@@ -110,43 +112,45 @@ async fn register_worker_in_peer_server(peer_addr: String) -> io::Result<TcpStre
     println!("Sent init_string to peer server: {}", init_string);
 
     // Read response from the peer server
-    let mut response = vec![0u8; 1024];
+    let mut response = vec![0u8; 8192];
     stream.read(&mut response).await?;
     println!("Got response from peer server");
 
     Ok(stream)
 }
 
-async fn distribute_task_to_workers(mut rx_request: mpsc::Receiver<Vec<u8>>, tx_response: mpsc::Sender<Vec<u8>>, replay_workers: SharedReplayServers) -> io::Result<()> {
+async fn distribute_task_to_workers(replay_workers: SharedReplayServers, sender_addr: String, data: Vec<u8>) -> io::Result<Vec<u8>> {
 
-    while let Some(data) = rx_request.recv().await {
-        println!("{} {}, worker_listener: received {} bytes from the channel", file!(), line!(), data.len());
-        // Let's acquire a replay server to do the task
+    let mut iter_num = 0;
+    loop {
         let replay_workers_locked = replay_workers.read().await;
-        let mut iter_num = 0;
-        loop {
-            if let Ok(replay_worker_stream) = replay_workers_locked[iter_num].try_lock() {
-                println!("worker_listener: try to distribute this task to {} worker", iter_num);
-                match distribute_task_to_one_server(data.clone(), replay_worker_stream).await {
-                    Ok(response) => {
-                        println!("{} {}, worker_listener: sent {} bytes to the channel", file!(), line!(), response.len());
-                        if let Err(e) = tx_response.send(response).await {
-                            println!("worker_listener: Error when sending response to channel: {:?}", e);
-                        }
-                        break;
-                    },
-                    Err(e) => {
-                        println!("worker_listener: Error when distributing task to one worker: {:?}", e);
-                    }
+        // Won't send the task back to the sender
+        if replay_workers_locked[iter_num].1 == sender_addr {
+            println!("distribute_task_to_workers: iter_num = {}, sender_ip = {}, replay_worker_ip = {}, skip this worker", iter_num, sender_addr, replay_workers_locked[iter_num].1);
+            iter_num = (iter_num + 1) % replay_workers_locked.len();
+            // sleep 10ms
+            tokio::time::sleep(time::Duration::from_millis(10)).await;
+            continue;
+        }
+
+        if let Ok(replay_worker_stream) = replay_workers_locked[iter_num].0.try_lock() {
+            println!("worker_listener: try to distribute this task to {} worker", iter_num);
+            match distribute_task_to_one_server(data.clone(), replay_worker_stream).await {
+                Ok(response) => {
+                    return Ok(response);
+                },
+                Err(e) => {
+                    println!("worker_listener: Error when distributing task to one worker: {:?}", e);
                 }
-            } else {
-                iter_num = (iter_num + 1) % replay_workers_locked.len();
             }
+        } else {
+            iter_num = (iter_num + 1) % replay_workers_locked.len();
+            // sleep 10ms
+            tokio::time::sleep(time::Duration::from_millis(10)).await;
         }
         
-        // println!("{} {}, client: got response from peer server: {:?}", file!(), line!(), response);
-    }
-    Ok(())
+        ; // Don't know why we need this semicolon
+    } 
 }
 
 async fn distribute_task_to_one_server(data: Vec<u8>, mut stream: tokio::sync::MutexGuard<'_, TcpStream>) -> io::Result<Vec<u8>> {
@@ -175,46 +179,36 @@ async fn distribute_task_to_one_server(data: Vec<u8>, mut stream: tokio::sync::M
     }
 }
 
-async fn handle_incoming_data(mut socket: TcpStream, tx_request: mpsc::Sender<Vec<u8>>, mut rx_response: mpsc::Receiver<Vec<u8>>) -> io::Result<()> {
+async fn handle_incoming_data(mut socket: TcpStream, replay_workers: SharedReplayServers) -> io::Result<()> {
     loop {
+        let replay_workers = Arc::clone(&replay_workers);
+
+        println!("{} {}, timeline_listener: waiting for data from the socket", file!(), line!());
 
         // Read the incoming data from the socket, then write it to Sender
-        let mut buffer = [0; 8192*20];
-        let mut n = socket.read(&mut buffer).await?;
-        if n == 0 {
+        let mut buffer = [0; 8192*10];
+        let mut total_read_size: usize = socket.read(&mut buffer).await?;
+        if total_read_size == 0 {
             return Ok(());
         }
         
         // Convert the buffer[1..5] to u32
         let target_buffer_size: u32 = u32::from_be_bytes(buffer[1..5].try_into().unwrap());
-        while n < (target_buffer_size+1) as usize  {
-            let n2 = socket.read(&mut buffer[n..]).await?;
-            n += n2;
+        println!("{} {}, timeline_listener: target_buffer_size = {}, received {} bytes", file!(), line!(), target_buffer_size, total_read_size);
+
+        let mut to_sent_msg = Vec::<u8>::new();
+        to_sent_msg.extend_from_slice(&buffer[..total_read_size]);
+        while total_read_size < (target_buffer_size+1) as usize  {
+            let n = socket.read(&mut buffer).await?;
+            to_sent_msg.extend_from_slice(&buffer[..n]);
+            total_read_size += n;
+            println!("{} {}, timeline_listener: received {} bytes from the socket", file!(), line!(), n);
         }
 
-        println!("{} {}, timeline_listener: received {} bytes from the socket", file!(), line!(), n);
-        match tx_request.send(buffer[..n].to_vec()).await {
-            Ok(_) => {},
-            Err(e) => {
-                println!("Error when sending data to channel: {:?}", e);
-                return Ok(());
-            }
-        }
-        println!("{} {}, timeline_listener: sent {} bytes to the channel", file!(), line!(), n);
+        let response = distribute_task_to_workers(replay_workers, socket.peer_addr().unwrap().ip().to_string()+socket.peer_addr().unwrap().to_string().as_str(), to_sent_msg).await?;
 
-        match rx_response.recv().await {
-            Some(response) => {
-                println!("{} {}, timeline_listener: received {} bytes from the channel", file!(), line!(), response.len());
-                socket.write_all(&response).await?;
-                socket.flush().await?;
-                println!("{} {}, timeline_listener: sent {} bytes to the socket", file!(), line!(), response.len());
-            },
-            None => {
-                println!("{} {}, timeline_listener: received None from the channel", file!(), line!());
-            }
-
-        }
-
+        socket.write_all(&response).await?;
+        socket.flush().await?;
     }
 }
 
