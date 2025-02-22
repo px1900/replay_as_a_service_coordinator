@@ -44,7 +44,7 @@ async fn main() -> io::Result<()> {
         {
             // Add the new replay server to the replay_workers
             let mut replay_workers_locked = replay_workers.write().await;
-            replay_workers_locked.push(Arc::new((tokio::sync::Mutex::new(new_replay_worker), socket.peer_addr().unwrap().ip().to_string()+socket.peer_addr().unwrap().port().to_string().as_str())));
+            replay_workers_locked.push(Arc::new((tokio::sync::Mutex::new(new_replay_worker), socket.peer_addr().unwrap().to_string())));
             println!("{} {}, timeline_listener: replay_workers.len() = {}", file!(), line!(), replay_workers_locked.len());
         }
 
@@ -52,10 +52,25 @@ async fn main() -> io::Result<()> {
 
         // Spawn a new task to handle the connection
         let replay_workers_for_task = Arc::clone(&replay_workers_for_task);
-        tokio::spawn(async {
+        let replay_workers_for_task2 = Arc::clone(&replay_workers_for_task);
+        tokio::spawn(async move {
+            let host_address = socket.peer_addr().unwrap().to_string();
             if let Err(e) = handle_connection(socket, replay_workers_for_task).await {
+                // println!("Connection broken with peer server {}, error : {:?}", socket.peer_addr().unwrap().ip().to_string()+socket.peer_addr().unwrap().port().to_string().as_str(), e);
                 eprintln!("Failed to handle connection; err = {:?}", e);
             }
+
+            // Delete the replay worker from the replay_workers
+            let mut replay_workers_locked = replay_workers_for_task2.write().await;
+            // Find the index of the replay worker
+            for (index, replay_worker) in replay_workers_locked.iter().enumerate() {
+                if replay_worker.1 == host_address {
+                    replay_workers_locked.remove(index); 
+                    break;
+                }
+            }
+
+            println!("{} {}, we detected the connection with peer server {} is broken, we will delete the corresponding worker, after deletion, there are {} available workers", file!(), line!(), host_address, replay_workers_locked.len());
         });
     }
 }
@@ -84,7 +99,17 @@ async fn handle_connection(mut socket: TcpStream, replay_workers: SharedReplaySe
     //     }
     // });
 
-    return handle_incoming_data(socket, replay_workers).await;
+    
+    match handle_incoming_data(socket, replay_workers).await {
+        Ok(_) => {
+            println!("Connection closed with peer server {}", peer_addr);
+            return Ok(());
+        },
+        Err(e) => {
+            println!("Error when handling connection with peer server {}: {:?}", peer_addr, e);
+            return Err(e);
+        }
+    }
 
 }
 
@@ -119,10 +144,23 @@ async fn register_worker_in_peer_server(peer_addr: String) -> io::Result<TcpStre
     Ok(stream)
 }
 
-async fn distribute_task_to_workers(replay_workers: SharedReplayServers, sender_addr: String, data: Vec<u8>) -> io::Result<Vec<u8>> {
+#[derive(Debug)]
+enum DistributeError {
+    WokerInvalid(String),
+    NoAvailableWorker,
+}
+
+async fn distribute_task_to_workers(replay_workers: &SharedReplayServers, sender_addr: String, data: &Vec<u8>) -> Result<Vec<u8>, DistributeError> {
 
     let mut iter_num = 0;
+    let mut retry_times = 0;
     loop {
+        if retry_times > replay_workers.read().await.len()*10 {
+            return Err(DistributeError::NoAvailableWorker);
+        } else {
+            retry_times += 1;
+        }
+
         let replay_workers_locked = replay_workers.read().await;
         // Won't send the task back to the sender
         if replay_workers_locked[iter_num].1 == sender_addr {
@@ -134,13 +172,15 @@ async fn distribute_task_to_workers(replay_workers: SharedReplayServers, sender_
         }
 
         if let Ok(replay_worker_stream) = replay_workers_locked[iter_num].0.try_lock() {
-            println!("worker_listener: try to distribute this task to {} worker", iter_num);
+            println!("worker_listener: try to distribute this task to {} worker, sender_addr = {}, worker_addr = {}", iter_num, sender_addr, replay_workers_locked[iter_num].1);
             match distribute_task_to_one_server(data.clone(), replay_worker_stream).await {
                 Ok(response) => {
                     return Ok(response);
                 },
                 Err(e) => {
                     println!("worker_listener: Error when distributing task to one worker: {:?}", e);
+                    // Delete this worker from replay_workers
+                    return Err(DistributeError::WokerInvalid(replay_workers_locked[iter_num].1.clone()));
                 }
             }
         } else {
@@ -150,7 +190,8 @@ async fn distribute_task_to_workers(replay_workers: SharedReplayServers, sender_
         }
         
         ; // Don't know why we need this semicolon
-    } 
+    }
+    
 }
 
 async fn distribute_task_to_one_server(data: Vec<u8>, mut stream: tokio::sync::MutexGuard<'_, TcpStream>) -> io::Result<Vec<u8>> {
@@ -180,6 +221,7 @@ async fn distribute_task_to_one_server(data: Vec<u8>, mut stream: tokio::sync::M
 }
 
 async fn handle_incoming_data(mut socket: TcpStream, replay_workers: SharedReplayServers) -> io::Result<()> {
+    let mut zero_times = 0;
     loop {
         let replay_workers = Arc::clone(&replay_workers);
 
@@ -187,10 +229,31 @@ async fn handle_incoming_data(mut socket: TcpStream, replay_workers: SharedRepla
 
         // Read the incoming data from the socket, then write it to Sender
         let mut buffer = [0; 8192*10];
-        let mut total_read_size: usize = socket.read(&mut buffer).await?;
-        if total_read_size == 0 {
-            return Ok(());
+
+        let mut total_read_size: usize = 0;
+
+        match socket.read(&mut buffer).await {
+            Ok(size) => match size {
+                0 => {
+                    // if zero_times < 10 {
+                    //     zero_times += 1;
+                    //     continue;
+                    // }
+                    return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Connection closed"));
+                }
+                _ => {
+                    total_read_size = size;
+                }
+            }
+            Err(e) => {
+                println!("Error when reading from pageserver socket: {:?}", e);
+                return Err(e);
+            }
         }
+        // let mut total_read_size: usize = socket.read(&mut buffer).await?;
+        // if total_read_size == 0 {
+            // return Ok(());
+        // }
         
         // Convert the buffer[1..5] to u32
         let target_buffer_size: u32 = u32::from_be_bytes(buffer[1..5].try_into().unwrap());
@@ -204,11 +267,61 @@ async fn handle_incoming_data(mut socket: TcpStream, replay_workers: SharedRepla
             total_read_size += n;
             println!("{} {}, timeline_listener: received {} bytes from the socket", file!(), line!(), n);
         }
+        
+        loop{
+            match distribute_task_to_workers(&replay_workers, socket.peer_addr().unwrap().to_string(), &to_sent_msg).await {
+                Ok(response) => {
+                    socket.write_all(&response).await?;
+                    socket.flush().await?;
+                    break;
+                },
+                Err(DistributeError::NoAvailableWorker) => {
+                    println!("Error when distributing task to workers: no available worker, we will return an error response");
+    
+                    // prepare the error response
+                    let mut error_response = vec![0u8; 8];
+                    // Message Format:
+                    //  u8 tag 'd': CopyData
+                    //  u32 length: the length of the message
+                    //  u8 tag '107': the error tag
+                    //  u8 success flag: 0 for failure, 1 for success
+                    //  u8 response list length
+    
+                    let length: u32 = 4+1+1+1;
+                    
+                    // Put a u8 tag 'd' at the beginning of the response
+                    error_response[0] = b'd';
+                    // Put the length of the message
+                    error_response[1..5].copy_from_slice(&length.to_be_bytes());
+                    // Put a u8 tag '107' at the beginning of the response
+                    error_response[5] = 107;
+                    // Put the success flag '0'
+                    error_response[6] = 0;
+                    // Put the repsonse list lengh 0
+                    error_response[7] = 0;
+    
+                    socket.write_all(&error_response).await?;
+                    socket.flush().await?;
+                    break;
+                }
+                Err(DistributeError::WokerInvalid(worker_addr)) => {
+                    println!("Error when distributing task to workers: worker {} is invalid, we will delete it", worker_addr);
 
-        let response = distribute_task_to_workers(replay_workers, socket.peer_addr().unwrap().ip().to_string()+socket.peer_addr().unwrap().to_string().as_str(), to_sent_msg).await?;
+                    let mut replay_workers_locked = replay_workers.write().await;
+                    for (index, replay_worker) in replay_workers_locked.iter().enumerate() {
+                        if replay_worker.1 == worker_addr {
+                            replay_workers_locked.remove(index);
+                            break;
+                        }
+                    }
 
-        socket.write_all(&response).await?;
-        socket.flush().await?;
+                    // replay_workers.write().await.remove(worker_index as usize);
+                    continue;
+                }
+            }
+        }
+
+        
     }
 }
 
